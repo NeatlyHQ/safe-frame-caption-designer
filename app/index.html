@@ -522,6 +522,51 @@
     return 0;
   }
 
+  // Exact union area of a list of axis-aligned rectangles (coordinate-
+  // compression sweep). Needed because simply SUMMING each zone's
+  // intersection with the text and capping the total at visibleArea does
+  // NOT equal the true union when zones overlap each other (see AUDIT
+  // finding #1): summing double-counts the shared region, and capping only
+  // hides the symptom once the sum happens to exceed visibleArea — it does
+  // nothing when the (still wrong) sum stays below visibleArea, which is
+  // exactly when a wrong verdict (e.g. "Blocked" instead of "Partially
+  // hidden") can reach the user.
+  function unionArea(rects) {
+    const valid = rects.filter(r => r.right > r.left && r.bottom > r.top);
+    if (valid.length === 0) return 0;
+    const xsSet = new Set();
+    valid.forEach(r => { xsSet.add(r.left); xsSet.add(r.right); });
+    const xs = Array.from(xsSet).sort((a, b) => a - b);
+    let area = 0;
+    for (let i = 0; i < xs.length - 1; i++) {
+      const xStart = xs[i], xEnd = xs[i + 1];
+      if (xEnd <= xStart) continue;
+      // Rects that fully span this vertical slab contribute their y-range
+      const yIntervals = [];
+      for (const r of valid) {
+        if (r.left <= xStart && r.right >= xEnd) yIntervals.push([r.top, r.bottom]);
+      }
+      if (yIntervals.length === 0) continue;
+      yIntervals.sort((a, b) => a[0] - b[0]);
+      let mergedLen = 0;
+      let curStart = yIntervals[0][0];
+      let curEnd = yIntervals[0][1];
+      for (let k = 1; k < yIntervals.length; k++) {
+        const [s, e] = yIntervals[k];
+        if (s <= curEnd) {
+          curEnd = Math.max(curEnd, e);
+        } else {
+          mergedLen += curEnd - curStart;
+          curStart = s;
+          curEnd = e;
+        }
+      }
+      mergedLen += curEnd - curStart;
+      area += (xEnd - xStart) * mergedLen;
+    }
+    return area;
+  }
+
   function computeCollision(platform) {
     const rawRect = getTextRect(platform);
     const screenRect = screens[platform].getBoundingClientRect();
@@ -539,20 +584,30 @@
     const offScreenArea = fullArea - visibleArea;
     if (visibleArea <= 0) return { hiddenPercent: 100, overlapZones: [] };
 
-    let totalIntersection = 0;
     const overlapZones = [];
+    const zoneIntersectRects = [];
     overlayZones[platform].forEach((zone, index) => {
       const zoneRect = getRect(platform, zone);
       const intersect = intersectionArea(textRect, zoneRect);
       if (intersect > 0) {
-        totalIntersection += intersect;
         overlapZones.push(index);
+        // Clip the zone to the visible text rect so unionArea() only ever
+        // deals with the portion that actually falls inside the text.
+        zoneIntersectRects.push({
+          left: Math.max(textRect.left, zoneRect.left),
+          right: Math.min(textRect.right, zoneRect.right),
+          top: Math.max(textRect.top, zoneRect.top),
+          bottom: Math.min(textRect.bottom, zoneRect.bottom)
+        });
       }
     });
 
-    // Cap the zone intersection at the visible text area: if two zones ever
-    // overlap, their common area must not be counted twice
-    totalIntersection = Math.min(totalIntersection, visibleArea);
+    // Compute the TRUE union of all overlapping zones (not a naive sum),
+    // so two zones that overlap each other over the text are not
+    // double-counted. This is guaranteed <= visibleArea by construction
+    // (each rect was clipped to textRect above); Math.min is kept only as
+    // a defensive floating-point safety net.
+    const totalIntersection = Math.min(unionArea(zoneIntersectRects), visibleArea);
     const hiddenPercent = Math.min(100, ((totalIntersection + offScreenArea) / fullArea) * 100);
     return { hiddenPercent, overlapZones };
   }
@@ -580,7 +635,14 @@
     // Values below the display rounding threshold (shown as "0.0%" or "<0.1%")
     // are reported as Safe so the badge matches what the user sees
     if (hiddenPercent < 0.05) return { badge: 'safe', text: 'Safe' };
-    if (hiddenPercent <= HIDDEN_THRESHOLD_BLOCKED) return { badge: 'warning', text: 'Partially hidden' };
+    // Compare against the SAME 1-decimal rounding used for the on-screen
+    // percentage (toFixed(1)), not the raw value. Without this, two values
+    // that both display as "30.0%" (e.g. 29.96 and 30.04) could get
+    // different badges ("Partially hidden" vs "Blocked"), which is
+    // confusing and was previously only patched for the 0%/0.05 boundary,
+    // not for this one.
+    const roundedForThreshold = Math.round(hiddenPercent * 10) / 10;
+    if (roundedForThreshold <= HIDDEN_THRESHOLD_BLOCKED) return { badge: 'warning', text: 'Partially hidden' };
     return { badge: 'blocked', text: 'Blocked' };
   }
 
@@ -889,13 +951,18 @@
         currentLine = '';
         continue;
       }
-      // Break words that are wider than maxWidth on their own
-      while (ctx.measureText(word).width > maxWidth && word.length > 1) {
-        let cut = word.length;
-        while (cut > 1 && ctx.measureText(word.slice(0, cut)).width > maxWidth) cut--;
+      // Break words that are wider than maxWidth on their own.
+      // Use code-point-aware slicing (Array.from / spread), NOT raw
+      // String.slice by UTF-16 index: a plain index cut can land in the
+      // middle of a surrogate pair (e.g. emoji), producing an unpaired
+      // surrogate that canvas fillText() renders as a broken glyph/tofu box.
+      while (ctx.measureText(word).width > maxWidth && [...word].length > 1) {
+        const chars = [...word];
+        let cut = chars.length;
+        while (cut > 1 && ctx.measureText(chars.slice(0, cut).join('')).width > maxWidth) cut--;
         if (currentLine) { lines.push(currentLine); currentLine = ''; }
-        lines.push(word.slice(0, cut));
-        word = word.slice(cut);
+        lines.push(chars.slice(0, cut).join(''));
+        word = chars.slice(cut).join('');
       }
       const testLine = currentLine ? currentLine + ' ' + word : word;
       const metrics = ctx.measureText(testLine);
